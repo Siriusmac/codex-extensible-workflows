@@ -1,0 +1,36 @@
+{
+  "name": "codex-extensible-workflows",
+  "version": "0.1.0",
+  "description": "Deterministic, resumable multi-agent workflows for Codex.",
+  "author": {
+    "name": "Community adaptation"
+  },
+  "homepage": "https://github.com/Siriusmac/codex-extensible-workflows",
+  "repository": "https://github.com/Siriusmac/codex-extensible-workflows",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "workflow",
+    "multi-agent",
+    "orchestration"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Extensible Workflows",
+    "shortDescription": "Run resumable multi-agent jobs",
+    "longDescription": "Adds a local workflow tool that fans Codex tasks out in parallel, waits efficiently for long runs, optionally reports progress, aggregates results, and resumes without repeating completed agent calls.",
+    "developerName": "Community adaptation",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Run parallel correctness, security, and test reviews",
+      "Create a Codex workflow for this task",
+      "Run this workflow with progress updates",
+      "Resume my latest interrupted workflow"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -1,0 +1,22 @@
+#!/bin/sh
+
+if [ -n "${CODEX_WORKFLOWS_NODE:-}" ] && [ -x "${CODEX_WORKFLOWS_NODE}" ]; then
+  workflow_node="${CODEX_WORKFLOWS_NODE}"
+elif command -v node >/dev/null 2>&1; then
+  workflow_node="$(command -v node)"
+else
+  workflow_node=""
+  for candidate in "${HOME}"/.cache/codex-runtimes/*/dependencies/node/bin/node; do
+    if [ -x "${candidate}" ]; then
+      workflow_node="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [ -z "${workflow_node}" ]; then
+  echo "Codex Extensible Workflows requires Node.js 22 or newer." >&2
+  exit 127
+fi
+
+exec "${workflow_node}" ./server.mjs

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codex-extensible-workflows": {
+      "command": "./bin/codex-workflows-mcp",
+      "cwd": ".",
+      "env_vars": ["CODEX_BIN", "CODEX_HOME", "CODEX_WORKFLOWS_NODE"]
+    }
+  }
+}
