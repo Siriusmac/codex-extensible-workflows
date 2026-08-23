@@ -1,13 +1,26 @@
 {
   "name": "codex-extensible-workflows",
-  "version": "0.1.0",
+  "version": "0.3.0",
+  "description": "Deterministic, resumable multi-agent workflows for Codex, adapted from vekexasia/pi-extensible-workflows.",
   "private": true,
   "type": "module",
   "scripts": {
     "test": "node --test"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
+  "homepage": "https://github.com/Siriusmac/codex-extensible-workflows",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Siriusmac/codex-extensible-workflows.git"
+  },
+  "keywords": [
+    "codex",
+    "workflow",
+    "multi-agent",
+    "orchestration",
+    "mcp"
+  ],
   "license": "MIT"
 }

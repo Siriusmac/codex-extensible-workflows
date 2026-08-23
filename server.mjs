@@ -1,14 +1,18 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { access, appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants as fsConstants, existsSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
-const SERVER = { name: "codex-extensible-workflows", version: "0.1.0" };
+// Independent Codex runtime adapter for the workflow model introduced by
+// https://github.com/vekexasia/pi-extensible-workflows. See NOTICE.md for the
+// upstream relationship and the Codex-specific compatibility boundary.
+const SERVER = { name: "codex-extensible-workflows", version: "0.3.0" };
 const RUNS_DIRECTORY = join(".codex", "workflow-runs");
+const TERMINAL_STATES = new Set(["completed", "failed", "stopped"]);
 const contextPath = new AsyncLocalStorage();
 const activeRuns = new Map();
 
@@ -36,6 +40,12 @@ function safeRunId(value) {
   return value;
 }
 
+function assertExpectedState(state, expectedState) {
+  if (expectedState !== undefined && state.state !== expectedState) {
+    throw new Error(`Workflow run "${state.id}" is ${state.state}, expected ${expectedState}`);
+  }
+}
+
 async function atomicWrite(path, value) {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -55,6 +65,56 @@ function runPaths(cwd, runId) {
     result: join(directory, "result.json"),
     events: join(directory, "events.jsonl"),
   };
+}
+
+function normalizeRetention(value) {
+  if (value === undefined) return undefined;
+  assertObject(value, "retention");
+  const olderThanDays = value.olderThanDays;
+  const maxTerminalRuns = value.maxTerminalRuns;
+  if (olderThanDays !== undefined && (!Number.isInteger(olderThanDays) || olderThanDays < 0)) {
+    throw new Error("retention.olderThanDays must be a non-negative integer");
+  }
+  if (maxTerminalRuns !== undefined && (!Number.isInteger(maxTerminalRuns) || maxTerminalRuns < 0)) {
+    throw new Error("retention.maxTerminalRuns must be a non-negative integer");
+  }
+  if (olderThanDays === undefined && maxTerminalRuns === undefined) {
+    throw new Error("retention must set olderThanDays or maxTerminalRuns");
+  }
+  return { olderThanDays, maxTerminalRuns };
+}
+
+async function applyRetention(cwd, retention) {
+  if (!retention) return;
+  const root = join(cwd, RUNS_DIRECTORY);
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const terminal = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[a-zA-Z0-9_-]+$/.test(entry.name)) continue;
+    try {
+      const paths = runPaths(cwd, entry.name);
+      const state = await readJson(paths.state);
+      if (!TERMINAL_STATES.has(state.state)) continue;
+      const details = await stat(paths.state);
+      terminal.push({ id: entry.name, updatedAt: state.updatedAt ?? details.mtimeMs });
+    } catch {
+      // Retention is best-effort and must not make workflow launch unavailable.
+    }
+  }
+  terminal.sort((left, right) => right.updatedAt - left.updatedAt);
+  const cutoff = retention.olderThanDays === undefined
+    ? undefined
+    : Date.now() - retention.olderThanDays * 24 * 60 * 60 * 1000;
+  const removals = terminal.filter((run, index) =>
+    (cutoff !== undefined && run.updatedAt < cutoff)
+    || (retention.maxTerminalRuns !== undefined && index >= retention.maxTerminalRuns));
+  await Promise.allSettled(removals.map(({ id }) => rm(runPaths(cwd, id).directory, { recursive: true, force: true })));
 }
 
 async function appendEvent(paths, event) {
@@ -136,64 +196,89 @@ function agentEnvironment() {
 async function codexAgent(promptText, options, runtime) {
   assertString(promptText, "agent prompt");
   assertObject(options, "agent options");
-  const outputPath = join(runtime.paths.directory, `agent-${runtime.fileCounter++}.txt`);
-  const command = findCodexBinary();
-  const args = [];
+  const retries = options.retries ?? 0;
+  const timeoutMs = options.timeoutMs ?? null;
+  if (!Number.isInteger(retries) || retries < 0 || retries > 255) {
+    throw new Error("agent retries must be an integer from 0 to 255");
+  }
+  if (timeoutMs !== null && (!Number.isInteger(timeoutMs) || timeoutMs < 1)) {
+    throw new Error("agent timeoutMs must be null or a positive integer");
+  }
   const model = options.model ?? runtime.defaults.model;
   const sandbox = options.sandbox ?? runtime.defaults.sandbox;
   const approvalPolicy = options.approvalPolicy ?? runtime.defaults.approvalPolicy;
   const reasoningEffort = options.reasoningEffort ?? runtime.defaults.reasoningEffort;
-  // --ask-for-approval is a global Codex option and must precede the `exec`
-  // subcommand. Other options below belong to `codex exec`.
-  if (approvalPolicy) args.push("-a", approvalPolicy);
-  args.push("exec", "--json", "--color", "never", "-C", runtime.cwd, "-o", outputPath);
-  if (model) args.push("-m", model);
-  if (sandbox) args.push("-s", sandbox);
-  if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
+  let schemaPath;
   if (options.outputSchema) {
-    const schemaPath = join(runtime.paths.directory, `schema-${runtime.fileCounter++}.json`);
+    schemaPath = join(runtime.paths.directory, `schema-${runtime.fileCounter++}.json`);
     await atomicWrite(schemaPath, options.outputSchema);
-    args.push("--output-schema", schemaPath);
   }
-  args.push(promptText);
 
-  const execution = await new Promise((resolveExecution, rejectExecution) => {
-    const child = spawn(command, args, {
-      cwd: runtime.cwd,
-      // The MCP launcher may locate Codex's bundled Node even when `node` is
-      // absent from PATH. Propagate that runtime to child agents so package
-      // managers whose shebang uses `/usr/bin/env node` can run normally.
-      env: agentEnvironment(),
-      stdio: ["ignore", "pipe", "pipe"],
+  let lastError;
+  for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+    const outputPath = join(runtime.paths.directory, `agent-${runtime.fileCounter++}.txt`);
+    const command = findCodexBinary();
+    const args = [];
+    // --ask-for-approval is a global Codex option and must precede `exec`.
+    if (approvalPolicy) args.push("-a", approvalPolicy);
+    args.push("exec", "--json", "--color", "never", "-C", runtime.cwd, "-o", outputPath);
+    if (model) args.push("-m", model);
+    if (sandbox) args.push("-s", sandbox);
+    if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
+    if (schemaPath) args.push("--output-schema", schemaPath);
+    args.push(promptText);
+
+    const execution = await new Promise((resolveExecution, rejectExecution) => {
+      const child = spawn(command, args, {
+        cwd: runtime.cwd,
+        env: agentEnvironment(),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      const timer = timeoutMs === null ? undefined : setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, timeoutMs);
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("error", (error) => {
+        if (timer) clearTimeout(timer);
+        rejectExecution(error);
+      });
+      child.on("close", (code, signal) => {
+        if (timer) clearTimeout(timer);
+        resolveExecution({ code, signal, stdout, stderr, timedOut });
+      });
     });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", rejectExecution);
-    child.on("close", (code, signal) => resolveExecution({ code, signal, stdout, stderr }));
-  });
 
-  if (execution.code !== 0) {
-    throw new Error(`Codex agent failed (${execution.code ?? execution.signal}): ${execution.stderr.trim() || execution.stdout.trim()}`);
-  }
-  const text = (await readFile(outputPath, "utf8")).trim();
-  let threadId;
-  for (const line of execution.stdout.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line);
-      if (event.type === "thread.started" && typeof event.thread_id === "string") {
-        threadId = event.thread_id;
+    if (execution.code === 0 && !execution.timedOut) {
+      const text = (await readFile(outputPath, "utf8")).trim();
+      let threadId;
+      for (const line of execution.stdout.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "thread.started" && typeof event.thread_id === "string") threadId = event.thread_id;
+        } catch {
+          // Preserve compatibility if Codex emits a non-JSON diagnostic line.
+        }
       }
-    } catch {
-      // Preserve compatibility if Codex emits a non-JSON diagnostic line.
+      const value = options.outputSchema ? JSON.parse(text) : text;
+      return { value, threadId, attempts: attempt };
+    }
+    const detail = execution.timedOut
+      ? `timed out after ${timeoutMs}ms`
+      : `${execution.code ?? execution.signal}: ${execution.stderr.trim() || execution.stdout.trim()}`;
+    lastError = new Error(`Codex agent attempt ${attempt} failed (${detail})`);
+    if (attempt <= retries) {
+      await appendEvent(runtime.paths, { type: "agent.retrying", attempt, nextAttempt: attempt + 1, error: lastError.message });
     }
   }
-  const value = options.outputSchema ? JSON.parse(text) : text;
-  return { value, threadId };
+  throw lastError;
 }
 
 function promptTemplate(template, values) {
@@ -248,6 +333,7 @@ function workflowGlobals(runtime) {
         state: "completed",
         value: result.value,
         label,
+        attempts: result.attempts,
         ...(result.threadId ? { threadId: result.threadId } : {}),
         completedAt: Date.now(),
       };
@@ -267,13 +353,16 @@ function workflowGlobals(runtime) {
   const parallel = async (name, tasks) => {
     assertString(name, "parallel name");
     assertObject(tasks, "parallel tasks");
-    const entries = await Promise.all(Object.entries(tasks).map(async ([taskName, task]) => {
+    const taskEntries = Object.entries(tasks);
+    const settled = await Promise.allSettled(taskEntries.map(async ([taskName, task]) => {
       if (typeof task !== "function") throw new Error(`parallel task "${taskName}" must be a function`);
       const path = [...(contextPath.getStore() ?? []), "parallel", encodeURIComponent(name), encodeURIComponent(taskName)];
       const value = await contextPath.run(path, task);
       return [taskName, value];
     }));
-    return Object.fromEntries(entries);
+    const failed = settled.find((result) => result.status === "rejected");
+    if (failed) throw failed.reason;
+    return Object.fromEntries(settled.map((result) => result.value));
   };
 
   const pipeline = async (name, steps, initial = null) => {
@@ -327,6 +416,95 @@ function normalizeDefaults(params) {
   };
 }
 
+const GUIDED_WORKFLOW_SCRIPT = `
+const guidedTasks = {};
+for (const task of args.tasks) {
+  guidedTasks[task.id] = () => agent(
+    "Workflow goal:\\n" + args.goal + "\\n\\nSubagent assignment:\\n" + task.prompt,
+    task.options,
+  );
+}
+const reports = await parallel("guided", guidedTasks);
+if (!args.synthesis) return reports;
+return agent(
+  args.synthesis.prompt + "\\n\\nGoal:\\n" + args.goal + "\\n\\nSubagent results:\\n" + JSON.stringify(reports, null, 2),
+  args.synthesis.options,
+);
+`;
+
+function guidedAgentOptions(value, defaultModel, defaultLabel) {
+  const options = {
+    label: value.label?.trim() || defaultLabel,
+    model: value.model?.trim() || defaultModel,
+    sandbox: value.sandbox,
+    approvalPolicy: value.approvalPolicy,
+    reasoningEffort: value.reasoningEffort,
+    outputSchema: value.outputSchema,
+    retries: value.retries,
+    timeoutMs: value.timeoutMs,
+  };
+  return Object.fromEntries(Object.entries(options).filter(([, option]) => option !== undefined));
+}
+
+function normalizeGuidedWorkflow(params) {
+  assertObject(params, "guided workflow arguments");
+  assertString(params.name, "name");
+  assertString(params.goal, "goal");
+  if (!Array.isArray(params.tasks) || params.tasks.length < 1 || params.tasks.length > 16) {
+    throw new Error("tasks must contain from 1 to 16 subagents");
+  }
+  const defaultModel = typeof params.defaultModel === "string" && params.defaultModel.trim()
+    ? params.defaultModel.trim()
+    : undefined;
+  const ids = new Set();
+  const tasks = params.tasks.map((task, index) => {
+    assertObject(task, `tasks[${index}]`);
+    assertString(task.id, `tasks[${index}].id`);
+    assertString(task.prompt, `tasks[${index}].prompt`);
+    const id = task.id.trim();
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(`tasks[${index}].id may contain only letters, numbers, underscores, and hyphens`);
+    if (ids.has(id)) throw new Error(`Duplicate guided task id "${id}"`);
+    ids.add(id);
+    const options = guidedAgentOptions(task, defaultModel, task.label?.trim() || id);
+    // Reuse the agent runtime validators before persisting the guided request.
+    if (options.retries !== undefined && (!Number.isInteger(options.retries) || options.retries < 0 || options.retries > 255)) {
+      throw new Error(`tasks[${index}].retries must be an integer from 0 to 255`);
+    }
+    if (options.timeoutMs !== undefined && options.timeoutMs !== null && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1)) {
+      throw new Error(`tasks[${index}].timeoutMs must be null or a positive integer`);
+    }
+    return { id, prompt: task.prompt.trim(), options };
+  });
+
+  let synthesis = null;
+  if (params.synthesis !== false) {
+    const requested = params.synthesis === undefined || params.synthesis === true ? {} : params.synthesis;
+    assertObject(requested, "synthesis");
+    const promptText = requested.prompt?.trim()
+      || "Produce a concise, coherent, and actionable final response that highlights priorities, risks, and next steps.";
+    synthesis = {
+      prompt: promptText,
+      options: guidedAgentOptions(requested, defaultModel, requested.label?.trim() || "Final synthesis"),
+    };
+  }
+  return {
+    goal: params.goal.trim(),
+    tasks,
+    synthesis,
+  };
+}
+
+export async function runGuidedWorkflow(params, background = true) {
+  const guided = normalizeGuidedWorkflow(params);
+  const workflowParams = {
+    ...params,
+    script: GUIDED_WORKFLOW_SCRIPT,
+    scriptPath: undefined,
+    args: guided,
+  };
+  return background ? startWorkflow(workflowParams) : runWorkflow(workflowParams);
+}
+
 export async function runWorkflow(params, resume = false, lifecycle = {}) {
   assertObject(params, "workflow arguments");
   const cwd = resolve(params.cwd ?? process.cwd());
@@ -341,6 +519,7 @@ export async function runWorkflow(params, resume = false, lifecycle = {}) {
     runId = safeRunId(params.runId);
     const paths = runPaths(cwd, runId);
     state = await readJson(paths.state);
+    assertExpectedState(state, params.expectedState);
     if (params.progressUpdates !== undefined) {
       state.progressUpdates = params.progressUpdates === true;
     }
@@ -348,6 +527,7 @@ export async function runWorkflow(params, resume = false, lifecycle = {}) {
     args = state.args;
   } else {
     assertString(params.name, "name");
+    await applyRetention(cwd, normalizeRetention(params.retention));
     runId = params.runId ? safeRunId(params.runId) : randomUUID();
     script = await loadScript(params, cwd);
     args = params.args ?? null;
@@ -453,6 +633,71 @@ export async function startWorkflow(params, resume = false) {
   return { ...info, background: true };
 }
 
+export async function retryWorkflow(params, lifecycle = {}) {
+  assertObject(params, "retry arguments");
+  const cwd = resolve(params.cwd ?? process.cwd());
+  const sourceRunId = safeRunId(params.runId);
+  const source = await readJson(runPaths(cwd, sourceRunId).state);
+  assertExpectedState(source, params.expectedState);
+  if (source.state !== "failed") {
+    throw new Error(`Workflow run "${sourceRunId}" is ${source.state}; only failed runs can be retried`);
+  }
+  const childRunId = params.newRunId ? safeRunId(params.newRunId) : randomUUID();
+  const childPaths = runPaths(cwd, childRunId);
+  try {
+    await access(childPaths.state);
+    throw new Error(`Workflow run "${childRunId}" already exists`);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const completedOperations = Object.fromEntries(
+    Object.entries(source.operations ?? {}).filter(([, operation]) => operation?.state === "completed"),
+  );
+  const child = {
+    ...source,
+    id: childRunId,
+    state: "failed",
+    operations: completedOperations,
+    parentRunId: sourceRunId,
+    retry: {
+      sourceRunId,
+      lineageRootRunId: source.retry?.lineageRootRunId ?? sourceRunId,
+      reusedOperationKeys: Object.keys(completedOperations),
+    },
+    progressUpdates: params.progressUpdates ?? source.progressUpdates ?? false,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  delete child.error;
+  delete child.result;
+  await atomicWrite(childPaths.state, child);
+  return runWorkflow({ cwd, runId: childRunId, progressUpdates: child.progressUpdates }, true, lifecycle);
+}
+
+export async function startRetryWorkflow(params) {
+  assertObject(params, "retry arguments");
+  const cwd = resolve(params.cwd ?? process.cwd());
+  const childRunId = params.newRunId ? safeRunId(params.newRunId) : randomUUID();
+  const key = `${cwd}\u0000${childRunId}`;
+  if (activeRuns.has(key)) throw new Error(`Workflow run "${childRunId}" is already active`);
+  let resolveStarted;
+  let rejectStarted;
+  let didStart = false;
+  const started = new Promise((resolvePromise, rejectPromise) => {
+    resolveStarted = resolvePromise;
+    rejectStarted = rejectPromise;
+  });
+  const execution = retryWorkflow(
+    { ...params, cwd, newRunId: childRunId },
+    { onStarted(info) { didStart = true; resolveStarted(info); } },
+  );
+  activeRuns.set(key, execution);
+  void execution.catch((error) => {
+    if (!didStart) rejectStarted(error);
+  }).finally(() => activeRuns.delete(key));
+  return { ...(await started), background: true, parentRunId: params.runId };
+}
+
 export async function workflowStatus(params) {
   assertObject(params, "status arguments");
   const cwd = resolve(params.cwd ?? process.cwd());
@@ -498,7 +743,7 @@ export async function workflowEvents(params) {
     if (state.progressUpdates !== true) {
       throw new Error("Progress updates are disabled for this run; start or resume it with progressUpdates=true after an explicit user request");
     }
-    if (events.length > cursor || state.state === "completed" || state.state === "failed" || Date.now() >= deadline) break;
+    if (events.length > cursor || TERMINAL_STATES.has(state.state) || Date.now() >= deadline) break;
     await sleep(Math.min(500, Math.max(1, deadline - Date.now())));
   } while (true);
   const selected = events.slice(cursor, cursor + limit);
@@ -527,11 +772,11 @@ export async function workflowWait(params) {
   let state;
   do {
     state = await readJson(paths.state);
-    if (state.state === "completed" || state.state === "failed" || Date.now() >= deadline) break;
+    if (TERMINAL_STATES.has(state.state) || Date.now() >= deadline) break;
     await sleep(Math.min(500, Math.max(1, deadline - Date.now())));
   } while (true);
 
-  const terminal = state.state === "completed" || state.state === "failed";
+  const terminal = TERMINAL_STATES.has(state.state);
   return {
     runId,
     state: state.state,
@@ -540,6 +785,7 @@ export async function workflowWait(params) {
     activeInThisServer: activeRuns.has(`${cwd}\u0000${runId}`),
     ...(terminal && state.state === "completed" ? { result: state.result ?? null } : {}),
     ...(terminal && state.state === "failed" ? { error: state.error ?? "Workflow failed" } : {}),
+    ...(terminal && state.state === "stopped" ? { error: state.error ?? "Workflow stopped" } : {}),
     runDirectory: paths.directory,
   };
 }
@@ -562,12 +808,94 @@ const TOOLS = [
         concurrency: { type: "integer", minimum: 1, maximum: 16, default: 4 },
         model: { type: "string" },
         sandbox: { type: "string", enum: ["read-only", "workspace-write", "danger-full-access"], default: "workspace-write" },
-        approvalPolicy: { type: "string", enum: ["untrusted", "on-request", "never"], default: "never" },
+        approvalPolicy: { type: "string", enum: ["on-request", "never"], default: "never" },
         reasoningEffort: { type: "string" },
+        retention: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            olderThanDays: { type: "integer", minimum: 0 },
+            maxTerminalRuns: { type: "integer", minimum: 0 }
+          },
+          description: "Optional best-effort cleanup policy for terminal runs, applied before launch."
+        },
         background: { type: "boolean", default: true, description: "Return a runId immediately instead of risking the 300-second foreground tool timeout." },
         progressUpdates: { type: "boolean", default: false, description: "Enable workflow_events. Use only when the user explicitly requests progress updates." }
       },
       oneOf: [{ required: ["script"] }, { required: ["scriptPath"] }]
+    }
+  },
+  {
+    name: "workflow_run_guided",
+    description: "Run a workflow from a declarative list of subagents. Designed for a conversational setup wizard: no JavaScript authoring is required, and every subagent may use a different Codex model.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "goal", "tasks"],
+      properties: {
+        name: { type: "string", minLength: 1 },
+        goal: { type: "string", minLength: 1 },
+        tasks: {
+          type: "array",
+          minItems: 1,
+          maxItems: 16,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["id", "prompt"],
+            properties: {
+              id: { type: "string", pattern: "^[a-zA-Z0-9_-]+$" },
+              label: { type: "string" },
+              prompt: { type: "string", minLength: 1 },
+              model: { type: "string", description: "Exact Codex model ID for this subagent; omit to use defaultModel or the user's Codex default." },
+              sandbox: { type: "string", enum: ["read-only", "workspace-write", "danger-full-access"] },
+              approvalPolicy: { type: "string", enum: ["on-request", "never"] },
+              reasoningEffort: { type: "string" },
+              outputSchema: { type: "object" },
+              retries: { type: "integer", minimum: 0, maximum: 255 },
+              timeoutMs: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] }
+            }
+          }
+        },
+        defaultModel: { type: "string", description: "Fallback model for subagents and synthesis without an explicit model." },
+        synthesis: {
+          description: "Omit or set true for a final synthesis agent, false to return raw reports, or provide its configuration.",
+          anyOf: [
+            { type: "boolean" },
+            {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                prompt: { type: "string" },
+                label: { type: "string" },
+                model: { type: "string" },
+                sandbox: { type: "string", enum: ["read-only", "workspace-write", "danger-full-access"] },
+                approvalPolicy: { type: "string", enum: ["on-request", "never"] },
+                reasoningEffort: { type: "string" },
+                outputSchema: { type: "object" },
+                retries: { type: "integer", minimum: 0, maximum: 255 },
+                timeoutMs: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] }
+              }
+            }
+          ]
+        },
+        cwd: { type: "string" },
+        runId: { type: "string" },
+        concurrency: { type: "integer", minimum: 1, maximum: 16, default: 4 },
+        sandbox: { type: "string", enum: ["read-only", "workspace-write", "danger-full-access"], default: "workspace-write" },
+        approvalPolicy: { type: "string", enum: ["on-request", "never"], default: "never" },
+        reasoningEffort: { type: "string" },
+        retention: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            olderThanDays: { type: "integer", minimum: 0 },
+            maxTerminalRuns: { type: "integer", minimum: 0 }
+          }
+        },
+        background: { type: "boolean", default: true },
+        progressUpdates: { type: "boolean", default: false, description: "Enable only when the user explicitly requests narrated progress." }
+      }
     }
   },
   {
@@ -621,7 +949,25 @@ const TOOLS = [
         runId: { type: "string" },
         cwd: { type: "string" },
         background: { type: "boolean", default: true },
+        expectedState: { type: "string", enum: ["running", "completed", "failed", "stopped"] },
         progressUpdates: { type: "boolean", description: "Enable or disable workflow_events for the resumed run; enable only after an explicit user request." }
+      }
+    }
+  },
+  {
+    name: "workflow_retry",
+    description: "Retry a failed workflow as a new durable run, reusing completed agent results and preserving lineage.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["runId"],
+      properties: {
+        runId: { type: "string", description: "Failed source run ID." },
+        newRunId: { type: "string", description: "Optional stable ID for the retry child." },
+        cwd: { type: "string" },
+        background: { type: "boolean", default: true },
+        expectedState: { type: "string", enum: ["failed"], default: "failed" },
+        progressUpdates: { type: "boolean", description: "Enable progress events only after an explicit user request." }
       }
     }
   }
@@ -629,14 +975,16 @@ const TOOLS = [
 
 async function callTool(name, args) {
   const background = args.background !== false;
-  if ((name === "workflow_run" || name === "workflow_resume") && args.progressUpdates === true && !background) {
+  if ((name === "workflow_run" || name === "workflow_run_guided" || name === "workflow_resume" || name === "workflow_retry") && args.progressUpdates === true && !background) {
     throw new Error("progressUpdates=true requires background=true");
   }
   if (name === "workflow_run") return background ? startWorkflow(args) : runWorkflow(args);
+  if (name === "workflow_run_guided") return runGuidedWorkflow(args, background);
   if (name === "workflow_status") return workflowStatus(args);
   if (name === "workflow_events") return workflowEvents(args);
   if (name === "workflow_wait") return workflowWait(args);
   if (name === "workflow_resume") return background ? startWorkflow(args, true) : runWorkflow(args, true);
+  if (name === "workflow_retry") return background ? startRetryWorkflow(args) : retryWorkflow(args);
   throw new Error(`Unknown tool "${name}"`);
 }
 

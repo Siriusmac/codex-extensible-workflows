@@ -1,11 +1,84 @@
 # Codex Extensible Workflows
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Upstream: pi-extensible-workflows](https://img.shields.io/badge/upstream-pi--extensible--workflows-blue)](https://github.com/vekexasia/pi-extensible-workflows)
 
-Proof-of-concept Codex adaptation of
-[vekexasia/pi-extensible-workflows](https://github.com/vekexasia/pi-extensible-workflows).
+Deterministic, resumable multi-agent workflow orchestration for Codex.
 
-It preserves the central authoring style:
+> [!IMPORTANT]
+> This project is an independent Codex adaptation of Andrea "vekexasia"
+> Baccega's original
+> [pi-extensible-workflows](https://github.com/vekexasia/pi-extensible-workflows).
+> The workflow authoring model, deterministic operation structure, persistence
+> concepts, parallel and pipeline composition, and recovery direction originate
+> in that project. This repository is not an official upstream distribution and
+> is not affiliated with vekexasia, Pi, or OpenAI.
+
+There is no runtime package dependency on the Pi project. Pi-specific host
+integration is replaced by a Codex plugin, a local MCP server, and separate
+non-interactive `codex exec --json` processes. Both projects use the MIT
+License; see [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+
+## Quick start
+
+After installing the plugin, ask Codex:
+
+> Start the workflow wizard for this project.
+
+The wizard asks only for missing information:
+
+1. What should the workflow accomplish?
+2. Should Codex narrate intermediate progress? The recommended default is no,
+   because progress updates consume additional conversation tokens.
+3. Should agents use the configured Codex default model, one shared model, or
+   a different model for each subagent?
+
+Codex then proposes two to four focused subagents and an optional synthesis
+agent, shows the complete model assignment for confirmation, and launches the
+workflow in the background.
+
+## Guided workflows without JavaScript
+
+`workflow_run_guided` accepts a declarative configuration. Every subagent and
+the synthesis agent may use a different model:
+
+```json
+{
+  "name": "review-release",
+  "goal": "Verify this project before release",
+  "tasks": [
+    {
+      "id": "correctness",
+      "label": "Correctness review",
+      "prompt": "Review correctness and regression risks",
+      "model": "gpt-model-a",
+      "sandbox": "read-only"
+    },
+    {
+      "id": "tests",
+      "label": "Test review",
+      "prompt": "Review test coverage and identify missing cases",
+      "model": "gpt-model-b",
+      "sandbox": "read-only"
+    }
+  ],
+  "synthesis": {
+    "prompt": "Prioritize the findings and recommend next steps",
+    "model": "gpt-model-c",
+    "sandbox": "read-only"
+  },
+  "background": true,
+  "progressUpdates": false
+}
+```
+
+Model IDs are passed unchanged to the Codex CLI. Omitting `model` uses
+`defaultModel`, when provided, or the user's configured Codex default.
+
+## Scripted workflow DSL
+
+Advanced users can keep the authoring style introduced by the original Pi
+project:
 
 ```js
 const reviews = await parallel("review", {
@@ -17,81 +90,130 @@ const reviews = await parallel("review", {
 return agent(prompt("Prioritize:\n{reviews}", { reviews }));
 ```
 
-The plugin exposes five local MCP tools:
+Supported workflow globals are `agent`, `parallel`, `pipeline`, `prompt`, and
+`log`. Per-agent options include `model`, `sandbox`, `approvalPolicy`,
+`reasoningEffort`, `outputSchema`, `retries`, `timeoutMs`, and `label`.
 
-- `workflow_run`: launch an inline script or a reviewed `scriptPath`; progress
-  reporting is disabled by default.
-- `workflow_status`: inspect persisted state and an agent progress summary.
-- `workflow_events`: read events incrementally from a cursor, with an optional
-  wait of up to 30 seconds for the next update.
-- `workflow_wait`: wait up to 55 seconds for only the terminal state, without
-  returning progress events.
-- `workflow_resume`: rerun the script while reusing completed agent calls; it
-  also supports background mode.
+## MCP tools
 
-Each `agent(...)` is a non-interactive `codex exec --json` session. Runs are
-stored under `<cwd>/.codex/workflow-runs/<runId>/`.
+The plugin exposes seven local MCP tools:
 
-The server prepends the directory of the Node executable that launched the
-plugin to every child agent's `PATH`. This makes project commands such as
-`pnpm test`, `pnpm lint`, and `pnpm run build` work when Codex uses its bundled
-Node runtime and the system shell does not provide `node` globally.
+- `workflow_run`: run a trusted inline script or reviewed `scriptPath`.
+- `workflow_run_guided`: run a declarative workflow with per-agent models.
+- `workflow_status`: inspect persisted state and the agent summary.
+- `workflow_events`: read explicitly enabled progress events from a cursor.
+- `workflow_wait`: wait compactly for terminal state without progress output.
+- `workflow_resume`: resume an interrupted run and reuse completed calls.
+- `workflow_retry`: create a child run from a failed run while preserving
+  lineage and reusing completed calls.
 
-## Live progress
+Each `agent(...)` launches a non-interactive Codex session. Runs are stored in
+`<cwd>/.codex/workflow-runs/<runId>/`.
 
-Long workflows should use background execution plus `workflow_wait`. A single
-foreground MCP call is subject to the host's 300-second timeout, while a
-workflow may legitimately take longer. Background mode therefore defaults to
-true. Call `workflow_wait` with `waitMs: 50000` until it returns
-`terminal: true`; do not narrate non-terminal waits. This is terminal waiting,
-not progress reporting, and its response stays deliberately compact.
+## Quiet execution and progress
 
-Live progress is opt-in because each update consumes conversation tokens. Do
-not poll status or events unless the user explicitly asks for progress updates.
-After such a request, start the workflow with both `background: true` and
-`progressUpdates: true`. Then call `workflow_events` with `cursor: 0`. Keep the
-returned `nextCursor` and use it in the next call with `waitMs: 30000`.
+Background execution defaults to true. Use `workflow_wait` with a wait below
+the MCP host timeout; the bundled skills use 50-second waits and do not narrate
+unchanged heartbeats.
 
-Background execution by itself does not enable progress events. A run without
-`progressUpdates: true` still persists events locally for recovery, but
-`workflow_events` will refuse to return them. Use `workflow_status` only for a
-requested snapshot, recovery, or the final result—not for periodic polling.
+Progress narration is deliberately opt-in. `background: true` does not imply
+permission to consume tokens with periodic updates. `workflow_events` is
+available only when the run was explicitly started or resumed with
+`progressUpdates: true`.
 
-Agent events include a readable label. Parallel tasks automatically use their
-task name; a direct agent can set one explicitly:
+Events report operational state and outcomes, not hidden model reasoning.
 
-```js
-return agent("Review privacy boundaries.", { label: "Privacy review" });
-```
+## Upstream relationship
 
-The event stream reports operational state and final outcomes. It does not
-expose hidden model reasoning.
+The comparison below is based on upstream `main` at commit
+`e5e6c837a216070bd5cd7f99b36db26a1517e5c5`, reviewed on 2026-08-23. Consult
+the [upstream repository](https://github.com/vekexasia/pi-extensible-workflows)
+and its [changelog](https://github.com/vekexasia/pi-extensible-workflows/blob/main/CHANGELOG.md)
+for later changes.
+
+### Concepts adapted from the original project
+
+- Deterministic named `parallel` and `pipeline` composition.
+- Agent orchestration with structured outputs.
+- Stable persisted operation keys and reusable completed results.
+- Durable run state, background execution, status inspection, and recovery.
+- Retry concepts, bounded concurrency, agent timeouts, and terminal-run
+  retention.
+- Trusted workflow scripts and JSON-compatible final results.
+
+### Pi-specific capabilities not implemented in this Codex adaptation
+
+These features depend on Pi extension APIs, Pi session ownership, Pi's model and
+resource registries, or Pi's TUI. They have not been simulated with incomplete
+substitutes:
+
+- Pi's `/workflow` command, startup recovery picker, navigator, inline workflow
+  widget, confirmation dialogs, and interactive checkpoints.
+- Trajectory's browser UI, Gantt timeline, transcript and tool inspection,
+  steering controls, and Pi session publisher lifecycle.
+- Herdr panes and live Pi-session handoff.
+- Pi role files, model aliases, extension and skill selectors, tool resource
+  policies, setup hooks, and `contextFiles` resolution.
+- Registered workflow functions such as `defineWorkflowFunction` and nested
+  catalog invocation.
+- Pi-owned named worktrees and worktree cleanup actions.
+- Aggregate token and cost budgets, accounting summaries, budget-exhaustion
+  dialogs, and provider-specific recovery state.
+- Durable standalone `subagents_*` tools, including live steer, stop, retry,
+  session handoff, and the `/subagents` TUI.
+- The `piewf` CLI, `piewf doctor`, Pi package discovery, and Pi release UI.
+
+Some of these capabilities may be added later only if Codex exposes an
+equivalent stable interface with compatible safety and persistence semantics.
+
+### Codex-specific additions beyond the original project
+
+- Installable Codex plugin packaging with `.codex-plugin/plugin.json` and a
+  local stdio MCP server.
+- Separate `codex exec --json` child sessions instead of Pi's in-process agent
+  runtime.
+- `workflow_run_guided`, a declarative launcher that requires no JavaScript.
+- `codex-workflow-wizard`, a conversational setup flow for goals, progress
+  visibility, agent roles, and model selection per subagent and synthesis.
+- Explicit `progressUpdates` consent and compact `workflow_wait` calls designed
+  to control conversation-token usage and remain below the MCP host timeout.
+- Codex CLI sandbox, approval-policy, reasoning-effort, and output-schema
+  mapping for every agent.
+- Codex bundled-Node `PATH` propagation so child agents can run project package
+  managers even when the system shell has no global Node.js installation.
+- `CODEX_BIN` and `CODEX_WORKFLOWS_NODE` overrides for desktop and local setups.
 
 ## Requirements
 
 - Codex CLI available as `codex`, or its path supplied through `CODEX_BIN`.
-- Node.js 22 or newer.
-- A writable project directory.
+- Node.js 22.19 or newer.
+- A writable project directory for persisted workflow runs.
 
-## Local validation
+## Development and validation
 
 ```sh
 npm test
 ```
 
-## Differences from the Pi project
+The package remains marked `private` in `package.json` to prevent accidental
+npm publication. That flag does not restrict the GitHub repository's public
+visibility.
 
-The upstream project is tightly integrated with Pi's extension API, session
-manager, model registry, TUI, and in-process agent runtime. This adaptation uses
-a Codex plugin plus MCP server and launches Codex agents through the supported
-non-interactive CLI surface.
+## Project status
 
-Version 0.1 includes the workflow DSL core, bounded concurrency, structured
-agent output, persistent operation results, background execution, compact
-terminal waiting, opt-in progress events, status, and resume. It does not yet
-include interactive checkpoints, the navigator UI, registered extension
-functions, aggregate budgets, named worktrees, or live steering.
+Version 0.3 is a working community adaptation with persistence, background
+execution, quiet waits, optional progress, guided and scripted launches,
+per-agent model selection, retry, timeout, resume, and retention support. It is
+not a drop-in replacement for the full Pi package.
 
-The upstream repository is MIT licensed. See [NOTICE.md](NOTICE.md) for
-attribution. This proof of concept is an independent adapter and is not an
-official upstream release or an OpenAI product.
+See [HANDOFF.md](HANDOFF.md) for the current implementation checkpoint and
+[CHANGELOG.md](CHANGELOG.md) for release history.
+
+## License and attribution
+
+This project is distributed under the MIT License, matching the license
+declared by the original Pi project. See [LICENSE](LICENSE).
+
+The original project is maintained by Andrea "vekexasia" Baccega:
+[github.com/vekexasia/pi-extensible-workflows](https://github.com/vekexasia/pi-extensible-workflows).
+See [NOTICE.md](NOTICE.md) for the full attribution statement.

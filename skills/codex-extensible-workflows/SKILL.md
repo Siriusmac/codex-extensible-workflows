@@ -7,6 +7,10 @@ description: Create and run deterministic, resumable multi-agent Codex workflows
 
 Use the `workflow_run` MCP tool for work that has at least two independent branches or a stable multi-step pipeline. Keep simple tasks in the current Codex task.
 
+When the user wants a guided setup, does not want to author JavaScript, or wants
+to choose a model per subagent, use the companion `codex-workflow-wizard` skill
+and `workflow_run_guided` instead.
+
 ## Default workflow
 
 1. Give the run a stable, descriptive `name`.
@@ -20,6 +24,8 @@ Use the `workflow_run` MCP tool for work that has at least two independent branc
 8. Enable progress reporting only when the user explicitly asks for updates.
 9. If a run is interrupted, call `workflow_resume` in background with the
    returned `runId`, then continue with `workflow_wait`.
+10. If a run failed and should be tried again, call `workflow_retry`; it creates
+    a new run ID and reuses completed operations without rewriting history.
 
 Example:
 
@@ -37,7 +43,7 @@ return await agent(
 
 Use `args` for user-supplied JSON values. Use `scriptPath` only for a reviewed file inside `cwd`.
 
-Per-agent options may set `model`, `sandbox`, `approvalPolicy`, `reasoningEffort`, and `outputSchema`.
+Per-agent options may set `model`, `sandbox`, `approvalPolicy`, `reasoningEffort`, `outputSchema`, `retries`, and `timeoutMs`.
 They may also set a short `label` for progress reporting. Parallel agents use
 their task key as the default label.
 
@@ -100,7 +106,10 @@ minute.
 - Use `read-only` for reviews and research.
 - Do not use `danger-full-access` unless the user explicitly authorizes it.
 - Do not put secrets in scripts, args, prompts, or persisted results.
+- Use `expectedState` on automated resume/retry calls to avoid acting on stale
+  state. Configure `retention` only when deletion of older terminal run
+  directories is intended; active runs are never removed.
 
 ## Current limits
 
-This adaptation supports `agent`, `parallel`, `pipeline`, `prompt`, `log`, persistent run state, background execution, compact terminal waiting, opt-in progress events, structured final output, and resume. It does not yet provide Pi's interactive checkpoints, workflow navigator UI, registered extension functions, aggregate token/cost budgets, named worktrees, or live steering.
+This adaptation supports `agent`, `parallel`, `pipeline`, `prompt`, `log`, persistent run state, background execution, compact terminal waiting, opt-in progress events, structured final output, guarded resume, lineage-preserving retry, agent retry/timeout controls, and opt-in terminal-run retention. It does not yet provide Pi's interactive checkpoints, workflow navigator or Trajectory UI, registered extension functions, aggregate token/cost budgets, standalone subagent controls, named worktrees, or live steering.

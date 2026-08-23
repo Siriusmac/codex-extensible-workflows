@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { runWorkflow, startWorkflow, workflowEvents, workflowStatus, workflowWait } from "../server.mjs";
+import { retryWorkflow, runGuidedWorkflow, runWorkflow, startWorkflow, workflowEvents, workflowStatus, workflowWait } from "../server.mjs";
 
 test("runs parallel agents and resumes from completed results", async () => {
   const root = await mkdtemp(join(tmpdir(), "codex-workflow-test-"));
@@ -199,4 +199,148 @@ test("validates prompt placeholders", async () => {
     }),
     /Unused prompt value/,
   );
+});
+
+test("retries a failed agent up to its configured limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-workflow-agent-retry-test-"));
+  await mkdir(join(root, ".git"));
+  const mock = join(root, "mock-codex.mjs");
+  const marker = join(root, "attempt.marker");
+  await writeFile(mock, `#!${process.execPath}
+import { access, writeFile } from "node:fs/promises";
+const args = process.argv.slice(2);
+const output = args[args.indexOf("-o") + 1];
+try { await access(${JSON.stringify(marker)}); }
+catch { await writeFile(${JSON.stringify(marker)}, "failed once"); process.exit(7); }
+await writeFile(output, "recovered");
+`, "utf8");
+  await chmod(mock, 0o755);
+  process.env.CODEX_BIN = mock;
+
+  const result = await runWorkflow({
+    name: "agent-retry",
+    cwd: root,
+    script: `return agent("flaky", { retries: 1 });`,
+  });
+  assert.equal(result.result, "recovered");
+  const status = await workflowStatus({ cwd: root, runId: result.runId });
+  assert.equal(status.operations["agent/1"].attempts, 2);
+});
+
+test("retries a failed workflow as a new lineage run and reuses completed operations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-workflow-lineage-test-"));
+  await mkdir(join(root, ".git"));
+  const mock = join(root, "mock-codex.mjs");
+  const calls = join(root, "calls.log");
+  const failedOnce = join(root, "failed-once.marker");
+  await writeFile(mock, `#!${process.execPath}
+import { access, appendFile, writeFile } from "node:fs/promises";
+const args = process.argv.slice(2);
+const output = args[args.indexOf("-o") + 1];
+const prompt = args.at(-1);
+await appendFile(${JSON.stringify(calls)}, prompt + "\\n");
+if (prompt === "bad") {
+  try { await access(${JSON.stringify(failedOnce)}); }
+  catch { await writeFile(${JSON.stringify(failedOnce)}, "failed once"); process.exit(8); }
+}
+await writeFile(output, "answer:" + prompt);
+`, "utf8");
+  await chmod(mock, 0o755);
+  process.env.CODEX_BIN = mock;
+
+  const script = `
+const values = await parallel("work", {
+  good: () => agent("good"),
+  bad: () => agent("bad"),
+});
+return values;
+`;
+  await assert.rejects(runWorkflow({ name: "lineage", cwd: root, runId: "source", script }));
+  const retried = await retryWorkflow({ cwd: root, runId: "source", newRunId: "child", expectedState: "failed" });
+  assert.equal(retried.state, "completed");
+  const child = await workflowStatus({ cwd: root, runId: "child" });
+  assert.equal(child.parentRunId, "source");
+  assert.equal(child.retry.lineageRootRunId, "source");
+  const callLines = (await readFile(calls, "utf8")).trim().split("\n").sort();
+  assert.deepEqual(callLines, ["bad", "bad", "good"]);
+});
+
+test("applies opt-in retention only to terminal workflow runs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-workflow-retention-test-"));
+  for (const runId of ["one", "two"]) {
+    await runWorkflow({ name: runId, cwd: root, runId, script: `return ${JSON.stringify(runId)};` });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await runWorkflow({
+    name: "three",
+    cwd: root,
+    runId: "three",
+    script: `return "three";`,
+    retention: { maxTerminalRuns: 1 },
+  });
+  await assert.rejects(workflowStatus({ cwd: root, runId: "one" }), /ENOENT/);
+  assert.equal((await workflowStatus({ cwd: root, runId: "two" })).state, "completed");
+  assert.equal((await workflowStatus({ cwd: root, runId: "three" })).state, "completed");
+});
+
+test("enforces agent timeouts and expected-state recovery guards", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-workflow-guards-test-"));
+  await mkdir(join(root, ".git"));
+  const mock = join(root, "mock-codex.mjs");
+  await writeFile(mock, `#!${process.execPath}
+import { writeFile } from "node:fs/promises";
+const args = process.argv.slice(2);
+const output = args[args.indexOf("-o") + 1];
+await new Promise((resolve) => setTimeout(resolve, 250));
+await writeFile(output, "late");
+`, "utf8");
+  await chmod(mock, 0o755);
+  process.env.CODEX_BIN = mock;
+
+  await assert.rejects(
+    runWorkflow({ name: "timeout", cwd: root, runId: "timeout", script: `return agent("slow", { timeoutMs: 10 });` }),
+    /timed out after 10ms/,
+  );
+  const completed = await runWorkflow({ name: "completed", cwd: root, runId: "completed", script: `return "done";` });
+  await assert.rejects(
+    runWorkflow({ cwd: root, runId: completed.runId, expectedState: "failed" }, true),
+    /is completed, expected failed/,
+  );
+  assert.equal((await workflowStatus({ cwd: root, runId: completed.runId })).state, "completed");
+});
+
+test("runs a declarative guided workflow with a different model per agent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-workflow-guided-test-"));
+  await mkdir(join(root, ".git"));
+  const mock = join(root, "mock-codex.mjs");
+  const calls = join(root, "guided-calls.log");
+  await writeFile(mock, `#!${process.execPath}
+import { appendFile, writeFile } from "node:fs/promises";
+const args = process.argv.slice(2);
+const output = args[args.indexOf("-o") + 1];
+const prompt = args.at(-1);
+const modelIndex = args.indexOf("-m");
+const model = modelIndex < 0 ? null : args[modelIndex + 1];
+await appendFile(${JSON.stringify(calls)}, JSON.stringify({ model, prompt }) + "\\n");
+await writeFile(output, "answer:" + model);
+`, "utf8");
+  await chmod(mock, 0o755);
+  process.env.CODEX_BIN = mock;
+
+  const result = await runGuidedWorkflow({
+    name: "guided",
+    goal: "Review the project",
+    cwd: root,
+    tasks: [
+      { id: "code", label: "Code", prompt: "Review the code", model: "gpt-code" },
+      { id: "tests", label: "Tests", prompt: "Review the tests", model: "gpt-tests" },
+    ],
+    synthesis: { prompt: "Summarize", model: "gpt-summary" },
+  }, false);
+  assert.equal(result.state, "completed");
+  assert.equal(result.result, "answer:gpt-summary");
+  const entries = (await readFile(calls, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(entries.map(({ model }) => model).sort(), ["gpt-code", "gpt-summary", "gpt-tests"]);
+  assert.ok(entries.some(({ prompt }) => prompt.includes("Workflow goal:\nReview the project")));
+  assert.ok(entries.some(({ prompt }) => prompt.includes("Subagent results:")));
 });
