@@ -1,6 +1,6 @@
 {
   "name": "codex-extensible-workflows",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Deterministic, resumable multi-agent workflows for Codex.",
   "author": {
     "name": "Community adaptation"
@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Codex Extensible Workflows",
     "shortDescription": "Build and run guided multi-agent workflows",
-    "longDescription": "Adds a conversational setup wizard and local workflow tools that assign optional models per subagent, fan Codex tasks out in parallel, wait efficiently, retry with durable lineage, optionally report progress, and recover without repeating completed work.",
+    "longDescription": "Adds a conversational setup wizard and local workflow tools that assign optional models per subagent, preserve named multi-turn agents, fan Codex tasks out in parallel, stop safely, wait efficiently, retry with durable lineage, optionally report progress, and recover without repeating completed work.",
     "developerName": "Community adaptation",
     "category": "Developer Tools",
     "capabilities": [
@@ -31,7 +31,8 @@
       "Start the workflow wizard for this project",
       "Configure a workflow with a different model for each subagent",
       "Run this workflow with progress updates",
-      "Resume my latest interrupted workflow"
+      "Resume my latest interrupted workflow",
+      "Stop my active workflow"
     ]
   },
   "mcpServers": "./.mcp.json"

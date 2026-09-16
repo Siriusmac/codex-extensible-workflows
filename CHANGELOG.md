@@ -4,6 +4,23 @@ This changelog covers the independent Codex adaptation. The original project
 has its own release history at
 https://github.com/vekexasia/pi-extensible-workflows/blob/main/CHANGELOG.md.
 
+## 0.4.0 - 2026-09-16
+
+- Compared the Codex adaptation with upstream `v5.14.0` at commit
+  `0292536c0c106feb006ba622168cf0fb44c686f2`.
+- Added persistent named agents through `agent.create({ name, ... }).send(...)`;
+  later turns resume the same Codex thread and completed turns remain replayable.
+- Reserved concurrency permits in JavaScript call order so bounded workflows
+  start agents deterministically even when persistence operations finish out of
+  order.
+- Added `workflow_stop` and process cancellation for runs active in the current
+  MCP server, with durable `stopped` agent and workflow events.
+- Cancelled and awaited outstanding Codex child work before recording a failed
+  workflow, matching upstream's bridge-work ownership direction.
+- Kept Pi-only extension settings, roles, portable `piewf` bundles, Trajectory,
+  Herdr, TUI pause/checkpoint flows, and Pi worktree lifecycle out of the Codex
+  compatibility boundary.
+
 ## 0.3.0 - 2026-08-23
 
 - Added `workflow_run_guided`, a declarative workflow launcher that does not

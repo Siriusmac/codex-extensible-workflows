@@ -1,6 +1,6 @@
 {
   "name": "codex-extensible-workflows",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Deterministic, resumable multi-agent workflows for Codex, adapted from vekexasia/pi-extensible-workflows.",
   "private": true,
   "type": "module",

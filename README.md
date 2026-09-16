@@ -94,9 +94,21 @@ Supported workflow globals are `agent`, `parallel`, `pipeline`, `prompt`, and
 `log`. Per-agent options include `model`, `sandbox`, `approvalPolicy`,
 `reasoningEffort`, `outputSchema`, `retries`, `timeoutMs`, and `label`.
 
+When one specialist should retain its Codex transcript across several turns,
+create a named persistent handle:
+
+```js
+const reviewer = agent.create({ name: "reviewer", model: "gpt-model-a" });
+const findings = await reviewer.send("Review the implementation.");
+return reviewer.send(prompt("Verify these fixes:\n{findings}", { findings }));
+```
+
+Handle turns use stable operation keys and resume the previous Codex thread.
+Completed turns are replayed from persisted state without contacting the model.
+
 ## MCP tools
 
-The plugin exposes seven local MCP tools:
+The plugin exposes eight local MCP tools:
 
 - `workflow_run`: run a trusted inline script or reviewed `scriptPath`.
 - `workflow_run_guided`: run a declarative workflow with per-agent models.
@@ -106,8 +118,11 @@ The plugin exposes seven local MCP tools:
 - `workflow_resume`: resume an interrupted run and reuse completed calls.
 - `workflow_retry`: create a child run from a failed run while preserving
   lineage and reusing completed calls.
+- `workflow_stop`: stop a run active in the current MCP server and terminate
+  its running Codex child processes.
 
-Each `agent(...)` launches a non-interactive Codex session. Runs are stored in
+Each ordinary `agent(...)` launches a non-interactive Codex session; named
+handle turns resume their prior session. Runs are stored in
 `<cwd>/.codex/workflow-runs/<runId>/`.
 
 ## Quiet execution and progress
@@ -125,8 +140,8 @@ Events report operational state and outcomes, not hidden model reasoning.
 
 ## Upstream relationship
 
-The comparison below is based on upstream `main` at commit
-`e5e6c837a216070bd5cd7f99b36db26a1517e5c5`, reviewed on 2026-08-23. Consult
+The comparison below is based on upstream `v5.14.0` at commit
+`0292536c0c106feb006ba622168cf0fb44c686f2`, reviewed on 2026-09-16. Consult
 the [upstream repository](https://github.com/vekexasia/pi-extensible-workflows)
 and its [changelog](https://github.com/vekexasia/pi-extensible-workflows/blob/main/CHANGELOG.md)
 for later changes.
@@ -139,6 +154,9 @@ for later changes.
 - Durable run state, background execution, status inspection, and recovery.
 - Retry concepts, bounded concurrency, agent timeouts, and terminal-run
   retention.
+- Persistent named agent handles whose turns retain one transcript.
+- Call-order admission under bounded concurrency and cancellation of running
+  agent work when a workflow is stopped or fails.
 - Trusted workflow scripts and JSON-compatible final results.
 
 ### Pi-specific capabilities not implemented in this Codex adaptation
@@ -201,10 +219,11 @@ visibility.
 
 ## Project status
 
-Version 0.3 is a working community adaptation with persistence, background
+Version 0.4 is a working community adaptation with persistence, background
 execution, quiet waits, optional progress, guided and scripted launches,
-per-agent model selection, retry, timeout, resume, and retention support. It is
-not a drop-in replacement for the full Pi package.
+per-agent model selection, persistent multi-turn agents, deterministic
+admission, stop, retry, timeout, resume, and retention support. It is not a
+drop-in replacement for the full Pi package.
 
 See [HANDOFF.md](HANDOFF.md) for the current implementation checkpoint and
 [CHANGELOG.md](CHANGELOG.md) for release history.

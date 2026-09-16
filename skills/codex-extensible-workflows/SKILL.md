@@ -26,6 +26,8 @@ and `workflow_run_guided` instead.
    returned `runId`, then continue with `workflow_wait`.
 10. If a run failed and should be tried again, call `workflow_retry`; it creates
     a new run ID and reuses completed operations without rewriting history.
+11. If the user asks to cancel a run that is active in this MCP server, call
+    `workflow_stop` with `expectedState: "running"`.
 
 Example:
 
@@ -46,6 +48,19 @@ Use `args` for user-supplied JSON values. Use `scriptPath` only for a reviewed f
 Per-agent options may set `model`, `sandbox`, `approvalPolicy`, `reasoningEffort`, `outputSchema`, `retries`, and `timeoutMs`.
 They may also set a short `label` for progress reporting. Parallel agents use
 their task key as the default label.
+
+When one specialist must keep its transcript across turns, use a stable named
+handle:
+
+```js
+const reviewer = agent.create({ name: "reviewer", model: "gpt-model-id" });
+const findings = await reviewer.send("Review the current implementation.");
+return reviewer.send(prompt("Verify the fixes for:\n{findings}", { findings }));
+```
+
+Each `send` is a durable operation. Later turns resume the previous Codex
+thread, while completed turns replay from persisted state. Keep handle names
+stable and unique within their workflow path.
 
 Child agents inherit an augmented `PATH` containing the Node runtime that
 launched the plugin. Prefer the project's existing package-manager commands;
@@ -109,7 +124,17 @@ minute.
 - Use `expectedState` on automated resume/retry calls to avoid acting on stale
   state. Configure `retention` only when deletion of older terminal run
   directories is intended; active runs are never removed.
+- Use `workflow_stop` only for an explicit user cancellation. It can safely
+  terminate only runs active in the same MCP server process.
 
 ## Current limits
 
-This adaptation supports `agent`, `parallel`, `pipeline`, `prompt`, `log`, persistent run state, background execution, compact terminal waiting, opt-in progress events, structured final output, guarded resume, lineage-preserving retry, agent retry/timeout controls, and opt-in terminal-run retention. It does not yet provide Pi's interactive checkpoints, workflow navigator or Trajectory UI, registered extension functions, aggregate token/cost budgets, standalone subagent controls, named worktrees, or live steering.
+This adaptation supports `agent`, persistent `agent.create` handles, `parallel`,
+`pipeline`, `prompt`, `log`, persistent run state, background execution,
+compact terminal waiting, opt-in progress events, structured final output,
+guarded resume, lineage-preserving retry, explicit stop, agent retry/timeout
+controls, deterministic call-order admission, and opt-in terminal-run
+retention. It does not yet provide Pi's interactive checkpoints, workflow
+navigator or Trajectory UI, registered extension functions, aggregate
+token/cost budgets, standalone subagent controls, named worktrees, or live
+steering.

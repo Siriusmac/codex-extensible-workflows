@@ -14,6 +14,11 @@ It replaces Pi's extension APIs, in-process agent runtime, model registry,
 session lifecycle, and TUI with a Codex plugin, a local stdio MCP server, and
 non-interactive `codex exec --json` child processes.
 
+Later Codex-compatible adaptations also include persistent named multi-turn
+agents, deterministic call-order admission, and cancellation of active child
+processes. Their implementation uses Codex CLI session resume and MCP lifecycle
+tools rather than Pi session APIs.
+
 Codex-specific work in this repository includes the declarative
 `workflow_run_guided` tool, the conversational `codex-workflow-wizard`, explicit
 opt-in progress reporting, compact MCP-safe terminal waiting, Codex CLI option

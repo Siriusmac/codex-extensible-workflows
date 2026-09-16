@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 // Independent Codex runtime adapter for the workflow model introduced by
 // https://github.com/vekexasia/pi-extensible-workflows. See NOTICE.md for the
 // upstream relationship and the Codex-specific compatibility boundary.
-const SERVER = { name: "codex-extensible-workflows", version: "0.3.0" };
+const SERVER = { name: "codex-extensible-workflows", version: "0.4.0" };
 const RUNS_DIRECTORY = join(".codex", "workflow-runs");
 const TERMINAL_STATES = new Set(["completed", "failed", "stopped"]);
 const contextPath = new AsyncLocalStorage();
@@ -138,7 +138,7 @@ function operationLabel(key, operation) {
 
 function workflowProgress(state) {
   const entries = Object.entries(state.operations ?? {});
-  const byState = { running: 0, completed: 0, failed: 0 };
+  const byState = { running: 0, completed: 0, failed: 0, stopped: 0 };
   for (const [, operation] of entries) {
     if (operation?.state in byState) byState[operation.state] += 1;
   }
@@ -163,17 +163,27 @@ class Semaphore {
     this.waiters = [];
   }
 
-  async use(operation) {
+  reserve() {
     if (this.active >= this.limit) {
-      await new Promise((resolveWaiter) => this.waiters.push(resolveWaiter));
+      return new Promise((resolveWaiter) => this.waiters.push(resolveWaiter))
+        .then(() => this.releaseFunction());
     }
     this.active += 1;
-    try {
-      return await operation();
-    } finally {
+    return Promise.resolve(this.releaseFunction());
+  }
+
+  releaseFunction() {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
       this.active -= 1;
-      this.waiters.shift()?.();
-    }
+      const next = this.waiters.shift();
+      if (next) {
+        this.active += 1;
+        next();
+      }
+    };
   }
 }
 
@@ -193,7 +203,7 @@ function agentEnvironment() {
   return environment;
 }
 
-async function codexAgent(promptText, options, runtime) {
+async function codexAgent(promptText, options, runtime, resumeThreadId) {
   assertString(promptText, "agent prompt");
   assertObject(options, "agent options");
   const retries = options.retries ?? 0;
@@ -216,16 +226,23 @@ async function codexAgent(promptText, options, runtime) {
 
   let lastError;
   for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+    if (runtime.signal.aborted) throw runtime.signal.reason ?? new Error("Workflow stopped");
     const outputPath = join(runtime.paths.directory, `agent-${runtime.fileCounter++}.txt`);
     const command = findCodexBinary();
     const args = [];
     // --ask-for-approval is a global Codex option and must precede `exec`.
     if (approvalPolicy) args.push("-a", approvalPolicy);
-    args.push("exec", "--json", "--color", "never", "-C", runtime.cwd, "-o", outputPath);
+    args.push("exec");
+    if (resumeThreadId) {
+      args.push("resume", "--json", "-o", outputPath);
+    } else {
+      args.push("--json", "--color", "never", "-C", runtime.cwd, "-o", outputPath);
+    }
     if (model) args.push("-m", model);
-    if (sandbox) args.push("-s", sandbox);
+    if (sandbox && !resumeThreadId) args.push("-s", sandbox);
     if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
     if (schemaPath) args.push("--output-schema", schemaPath);
+    if (resumeThreadId) args.push(resumeThreadId);
     args.push(promptText);
 
     const execution = await new Promise((resolveExecution, rejectExecution) => {
@@ -237,24 +254,35 @@ async function codexAgent(promptText, options, runtime) {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      let aborted = false;
       const timer = timeoutMs === null ? undefined : setTimeout(() => {
         timedOut = true;
         child.kill("SIGTERM");
       }, timeoutMs);
+      const abort = () => {
+        aborted = true;
+        child.kill("SIGTERM");
+      };
+      runtime.signal.addEventListener("abort", abort, { once: true });
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk) => { stdout += chunk; });
       child.stderr.on("data", (chunk) => { stderr += chunk; });
       child.on("error", (error) => {
         if (timer) clearTimeout(timer);
+        runtime.signal.removeEventListener("abort", abort);
         rejectExecution(error);
       });
       child.on("close", (code, signal) => {
         if (timer) clearTimeout(timer);
-        resolveExecution({ code, signal, stdout, stderr, timedOut });
+        runtime.signal.removeEventListener("abort", abort);
+        resolveExecution({ code, signal, stdout, stderr, timedOut, aborted });
       });
     });
 
+    if (execution.aborted || runtime.signal.aborted) {
+      throw runtime.signal.reason ?? new Error("Workflow stopped");
+    }
     if (execution.code === 0 && !execution.timedOut) {
       const text = (await readFile(outputPath, "utf8")).trim();
       let threadId;
@@ -268,7 +296,7 @@ async function codexAgent(promptText, options, runtime) {
         }
       }
       const value = options.outputSchema ? JSON.parse(text) : text;
-      return { value, threadId, attempts: attempt };
+      return { value, threadId: threadId ?? resumeThreadId, attempts: attempt };
     }
     const detail = execution.timedOut
       ? `timed out after ${timeoutMs}ms`
@@ -304,6 +332,7 @@ function operationKey(kind, name) {
 
 function workflowGlobals(runtime) {
   const counters = new Map();
+  const handleCounters = new Map();
 
   const nextAgentKey = () => {
     const parent = contextPath.getStore() ?? [];
@@ -313,22 +342,24 @@ function workflowGlobals(runtime) {
     return [...parent, "agent", String(count)].join("/");
   };
 
-  const agent = async (agentPrompt, options = {}) => {
-    const key = nextAgentKey();
+  const runAgentOperation = async (key, agentPrompt, options, resumeThreadId) => {
     const cached = runtime.state.operations[key];
     if (cached?.state === "completed") {
       await appendEvent(runtime.paths, { type: "agent.cached", key });
       return cached.value;
     }
+    const permit = runtime.semaphore.reserve();
+    let release;
     const label = typeof options.label === "string" && options.label.trim()
       ? options.label.trim()
       : operationLabel(key);
-    runtime.state.operations[key] = { state: "running", prompt: agentPrompt, label, startedAt: Date.now() };
-    runtime.state.updatedAt = Date.now();
-    await atomicWrite(runtime.paths.state, runtime.state);
-    await appendEvent(runtime.paths, { type: "agent.started", key, label });
     try {
-      const result = await runtime.semaphore.use(() => codexAgent(agentPrompt, options, runtime));
+      runtime.state.operations[key] = { state: "running", prompt: agentPrompt, label, startedAt: Date.now() };
+      runtime.state.updatedAt = Date.now();
+      await atomicWrite(runtime.paths.state, runtime.state);
+      await appendEvent(runtime.paths, { type: "agent.started", key, label });
+      release = await permit;
+      const result = await codexAgent(agentPrompt, options, runtime, resumeThreadId);
       runtime.state.operations[key] = {
         state: "completed",
         value: result.value,
@@ -342,12 +373,68 @@ function workflowGlobals(runtime) {
       await appendEvent(runtime.paths, { type: "agent.completed", key, label, threadId: result.threadId });
       return result.value;
     } catch (error) {
-      runtime.state.operations[key] = { state: "failed", error: String(error), label, failedAt: Date.now() };
+      const stopped = runtime.signal.aborted;
+      runtime.state.operations[key] = {
+        state: stopped ? "stopped" : "failed",
+        error: String(error),
+        label,
+        [stopped ? "stoppedAt" : "failedAt"]: Date.now(),
+      };
       runtime.state.updatedAt = Date.now();
       await atomicWrite(runtime.paths.state, runtime.state);
-      await appendEvent(runtime.paths, { type: "agent.failed", key, label, error: String(error) });
+      await appendEvent(runtime.paths, { type: stopped ? "agent.stopped" : "agent.failed", key, label, error: String(error) });
       throw error;
+    } finally {
+      if (release) release();
+      else void permit.then((reservedRelease) => reservedRelease()).catch(() => {});
     }
+  };
+
+  const track = (promise) => {
+    runtime.inFlight.add(promise);
+    void promise.finally(() => runtime.inFlight.delete(promise)).catch(() => {});
+    return promise;
+  };
+
+  const agent = (agentPrompt, options = {}) =>
+    track(runAgentOperation(nextAgentKey(), agentPrompt, options));
+
+  agent.create = (options = {}) => {
+    assertObject(options, "agent.create options");
+    const name = options.name;
+    assertString(name, "agent.create name");
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+      throw new Error("agent.create name may contain only letters, numbers, underscores, and hyphens");
+    }
+    const baseOptions = { ...options };
+    delete baseOptions.name;
+    return Object.freeze({
+      name,
+      send(agentPrompt, turnOptions = {}) {
+        assertObject(turnOptions, `agent handle "${name}" turn options`);
+        if (turnOptions.sandbox !== undefined) {
+          throw new Error(`Agent handle "${name}" sandbox is fixed when the handle is created`);
+        }
+        const parent = contextPath.getStore() ?? [];
+        const counterKey = [...parent, name].join("/");
+        const turn = (handleCounters.get(counterKey) ?? 0) + 1;
+        handleCounters.set(counterKey, turn);
+        const prefix = [...parent, "agent", "handle", encodeURIComponent(name)];
+        const key = [...prefix, `turn:${turn}`].join("/");
+        const previous = turn === 1
+          ? undefined
+          : runtime.state.operations[[...prefix, `turn:${turn - 1}`].join("/")];
+        if (turn > 1 && (previous?.state !== "completed" || !previous.threadId)) {
+          throw new Error(`Agent handle "${name}" cannot run turn ${turn} without a completed previous turn`);
+        }
+        return track(runAgentOperation(
+          key,
+          agentPrompt,
+          { ...baseOptions, ...turnOptions },
+          previous?.threadId,
+        ));
+      },
+    });
   };
 
   const parallel = async (name, tasks) => {
@@ -560,12 +647,18 @@ export async function runWorkflow(params, resume = false, lifecycle = {}) {
   await atomicWrite(paths.state, state);
   await appendEvent(paths, { type: resume ? "workflow.resumed" : "workflow.started", runId });
   lifecycle.onStarted?.({ runId, state: state.state, runDirectory: paths.directory });
+  const executionController = new AbortController();
+  const forwardAbort = () => executionController.abort(lifecycle.signal.reason);
+  if (lifecycle.signal?.aborted) forwardAbort();
+  else lifecycle.signal?.addEventListener("abort", forwardAbort, { once: true });
   const runtime = {
     cwd,
     paths,
     state,
     defaults: resume ? state.defaults : defaults,
     semaphore: new Semaphore((resume ? state.defaults : defaults).concurrency),
+    signal: executionController.signal,
+    inFlight: new Set(),
     fileCounter: 1,
   };
   const globals = workflowGlobals(runtime);
@@ -588,12 +681,21 @@ export async function runWorkflow(params, resume = false, lifecycle = {}) {
     await appendEvent(paths, { type: "workflow.completed", runId });
     return { runId, state: state.state, result: state.result, runDirectory: paths.directory };
   } catch (error) {
-    state.state = "failed";
+    const stopped = executionController.signal.aborted && lifecycle.signal?.aborted;
+    if (!executionController.signal.aborted) executionController.abort(new Error("Workflow failed"));
+    await Promise.allSettled([...runtime.inFlight]);
+    state.state = stopped ? "stopped" : "failed";
     state.error = error instanceof Error ? error.message : String(error);
     state.updatedAt = Date.now();
     await atomicWrite(paths.state, state);
-    await appendEvent(paths, { type: "workflow.failed", runId, error: state.error });
+    await appendEvent(paths, { type: stopped ? "workflow.stopped" : "workflow.failed", runId, error: state.error });
+    lifecycle.signal?.removeEventListener("abort", forwardAbort);
+    if (stopped) {
+      return { runId, state: state.state, error: state.error, runDirectory: paths.directory };
+    }
     throw Object.assign(new Error(state.error), { runId, runDirectory: paths.directory });
+  } finally {
+    lifecycle.signal?.removeEventListener("abort", forwardAbort);
   }
 }
 
@@ -613,6 +715,7 @@ export async function startWorkflow(params, resume = false) {
     resolveStarted = resolvePromise;
     rejectStarted = rejectPromise;
   });
+  const controller = new AbortController();
   const execution = runWorkflow(
     { ...params, cwd, runId: requestedRunId },
     resume,
@@ -621,9 +724,10 @@ export async function startWorkflow(params, resume = false) {
         didStart = true;
         resolveStarted(info);
       },
+      signal: controller.signal,
     },
   );
-  activeRuns.set(key, execution);
+  activeRuns.set(key, { execution, controller });
   void execution.catch((error) => {
     if (!didStart) rejectStarted(error);
   }).finally(() => {
@@ -687,15 +791,34 @@ export async function startRetryWorkflow(params) {
     resolveStarted = resolvePromise;
     rejectStarted = rejectPromise;
   });
+  const controller = new AbortController();
   const execution = retryWorkflow(
     { ...params, cwd, newRunId: childRunId },
-    { onStarted(info) { didStart = true; resolveStarted(info); } },
+    { onStarted(info) { didStart = true; resolveStarted(info); }, signal: controller.signal },
   );
-  activeRuns.set(key, execution);
+  activeRuns.set(key, { execution, controller });
   void execution.catch((error) => {
     if (!didStart) rejectStarted(error);
   }).finally(() => activeRuns.delete(key));
   return { ...(await started), background: true, parentRunId: params.runId };
+}
+
+export async function workflowStop(params) {
+  assertObject(params, "stop arguments");
+  const cwd = resolve(params.cwd ?? process.cwd());
+  const runId = safeRunId(params.runId);
+  const paths = runPaths(cwd, runId);
+  const state = await readJson(paths.state);
+  assertExpectedState(state, params.expectedState);
+  if (TERMINAL_STATES.has(state.state)) {
+    return { runId, state: state.state, terminal: true, runDirectory: paths.directory };
+  }
+  const active = activeRuns.get(`${cwd}\u0000${runId}`);
+  if (!active) throw new Error(`Workflow run "${runId}" is not active in this server and cannot be stopped safely`);
+  active.controller.abort(new Error(params.reason?.trim() || "Workflow stopped by request"));
+  await active.execution;
+  const stopped = await readJson(paths.state);
+  return { runId, state: stopped.state, terminal: TERMINAL_STATES.has(stopped.state), runDirectory: paths.directory };
 }
 
 export async function workflowStatus(params) {
@@ -970,6 +1093,21 @@ const TOOLS = [
         progressUpdates: { type: "boolean", description: "Enable progress events only after an explicit user request." }
       }
     }
+  },
+  {
+    name: "workflow_stop",
+    description: "Stop a workflow that is active in this MCP server and terminate its running Codex child agents.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["runId"],
+      properties: {
+        runId: { type: "string" },
+        cwd: { type: "string" },
+        expectedState: { type: "string", enum: ["running"], default: "running" },
+        reason: { type: "string", description: "Optional user-facing stop reason." }
+      }
+    }
   }
 ];
 
@@ -985,6 +1123,7 @@ async function callTool(name, args) {
   if (name === "workflow_wait") return workflowWait(args);
   if (name === "workflow_resume") return background ? startWorkflow(args, true) : runWorkflow(args, true);
   if (name === "workflow_retry") return background ? startRetryWorkflow(args) : retryWorkflow(args);
+  if (name === "workflow_stop") return workflowStop(args);
   throw new Error(`Unknown tool "${name}"`);
 }
 
